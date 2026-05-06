@@ -1,11 +1,13 @@
 """OpenAI-style chat base for :class:`OpenAIChatTransport` (NIM, etc.).
 
-``AnthropicMessagesTransport``-based providers (OpenRouter, LM Studio, DeepSeek, …) live
-in separate modules; do not list them as subclasses of this class.
+All transient errors (network, empty HTTP 200, 5xx, 429) are retried forever,
+with delays: 1s, 2s, 3s, 5s, 10s, then 15s (with jitter).
+Never exposes network errors to the user.
 """
 
 import asyncio
 import json
+import random
 import uuid
 from abc import abstractmethod
 from collections.abc import AsyncIterator, Iterator
@@ -13,21 +15,16 @@ from typing import Any
 
 import httpx
 from loguru import logger
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError, RateLimitError
 
 from core.anthropic import (
     ContentType,
     HeuristicToolParser,
     SSEBuilder,
     ThinkTagParser,
-    append_request_id,
     map_stop_reason,
 )
 from providers.base import BaseProvider, ProviderConfig
-from providers.error_mapping import (
-    map_error,
-    user_visible_message_for_mapped_provider_error,
-)
 from providers.rate_limit import GlobalRateLimiter
 
 
@@ -90,7 +87,7 @@ class OpenAIChatTransport(BaseProvider):
         self._client = AsyncOpenAI(
             api_key=self._api_key,
             base_url=self._base_url,
-            max_retries=0,
+            max_retries=0,  # We handle all retries ourselves
             timeout=httpx.Timeout(
                 config.http_read_timeout,
                 connect=config.http_connect_timeout,
@@ -122,27 +119,119 @@ class OpenAIChatTransport(BaseProvider):
         """Return a modified request body for one retry, or None."""
         return None
 
-    async def _create_stream(self, body: dict) -> tuple[Any, dict]:
-        """Create a streaming chat completion, optionally retrying once."""
-        try:
-            stream = await self._global_rate_limiter.execute_with_retry(
-                self._client.chat.completions.create, **body, stream=True
-            )
-            return stream, body
-        except Exception as error:
-            retry_body = self._get_retry_request_body(error, body)
-            if retry_body is None:
-                raise
+    def _is_thinking_enabled(self, request: Any, override: bool | None) -> bool:
+        """Determine if thinking should be enabled for this request."""
+        if override is not None:
+            return override
+        return getattr(request, "thinking_enabled", False)
 
-            stream = await self._global_rate_limiter.execute_with_retry(
-                self._client.chat.completions.create, **retry_body, stream=True
-            )
-            return stream, retry_body
+    # --------------------------------------------------------------------------
+    #  Retry forever with delays: 1s, 2s, 3s, 5s, 10s, then 15s (with jitter)
+    # --------------------------------------------------------------------------
+    async def _create_stream_with_retry(self, body: dict) -> tuple[Any, dict]:
+        """Create a streaming chat completion, retrying forever on retryable errors.
 
+        Delays after each failure:
+        - 1st retry: ~1s (±50% jitter)
+        - 2nd: ~2s
+        - 3rd: ~3s
+        - 4th: ~5s
+        - 5th: ~10s
+        - 6th and further: ~15s
+        """
+        # Fixed delays in seconds (without jitter)
+        DELAYS = [1, 2, 3, 5, 10]
+        # After these, use 15s
+        DEFAULT_DELAY = 15
+
+        attempt = 0  # number of retries already performed (0 = first try)
+        last_error = None
+
+        while True:
+            try:
+                if attempt > 0:
+                    # Compute delay based on attempt count
+                    idx = attempt - 1  # 0-based index into DELAYS
+                    if idx < len(DELAYS):
+                        delay = DELAYS[idx]
+                    else:
+                        delay = DEFAULT_DELAY
+                    # Add jitter: random factor between 0.5 and 1.5
+                    delay = delay * (0.5 + random.random())
+                    logger.warning(
+                        f"[{self._provider_name}] 🔄 Retry #{attempt} "
+                        f"dans {delay:.1f}s après erreur: {last_error}"
+                    )
+                    await asyncio.sleep(delay)
+
+                # Attempt to create the stream
+                stream = await self._global_rate_limiter.execute_with_retry(
+                    self._client.chat.completions.create, **body, stream=True
+                )
+                return stream, body
+
+            except Exception as e:
+                last_error = e
+                error_lower = str(e).lower()
+                status_code = getattr(e, 'status_code', None)
+                is_rate_limit = (
+                    isinstance(e, RateLimitError) or "429" in error_lower or "rate limit" in error_lower
+                )
+                # Detect HTTP 200 empty/malformed responses (broken proxies)
+                is_empty_200 = (
+                    status_code == 200
+                    and any(phrase in error_lower for phrase in [
+                        "empty", "malformed", "incomplete", "unexpected end", "no content"
+                    ])
+                )
+                # Retryable conditions
+                is_retryable = (
+                    isinstance(e, APIConnectionError)
+                    or "timeout" in error_lower
+                    or "connection" in error_lower
+                    or "incomplete chunked read" in error_lower
+                    or "peer closed connection" in error_lower
+                    or "remote disconnected" in error_lower
+                    or "socket" in error_lower
+                    or "500" in str(e) or "502" in str(e) or "503" in str(e) or "504" in str(e)
+                    or is_rate_limit
+                    or is_empty_200
+                )
+
+                # If not retryable, try to modify request body (once)
+                if not is_retryable:
+                    retry_body = self._get_retry_request_body(e, body)
+                    if retry_body is not None:
+                        try:
+                            logger.warning(
+                                f"[{self._provider_name}] Tentative avec body modifié "
+                                f"(après erreur {status_code or '?'})"
+                            )
+                            stream = await self._global_rate_limiter.execute_with_retry(
+                                self._client.chat.completions.create, **retry_body, stream=True
+                            )
+                            return stream, retry_body
+                        except Exception as e2:
+                            last_error = e2
+                            # Fall through: increment attempt and retry normally
+                            attempt += 1
+                            continue
+
+                if not is_retryable:
+                    # Non‑retryable error (e.g., 400 bad request, auth error) – give up
+                    logger.error(f"[{self._provider_name}] Non‑retryable error, giving up: {e}")
+                    raise
+
+                # Otherwise, increment attempt counter and retry
+                attempt += 1
+                # Continue the loop (will wait and retry)
+
+    # --------------------------------------------------------------------------
+    #  Tool argument handling (unchanged)
+    # --------------------------------------------------------------------------
     def _emit_tool_arg_delta(
         self, sse: SSEBuilder, tc_index: int, args: str
     ) -> Iterator[str]:
-        """Emit one argument fragment for a started tool block (Task buffer or raw JSON)."""
         if not args:
             return
         state = sse.blocks.tool_states.get(tc_index)
@@ -156,7 +245,6 @@ class OpenAIChatTransport(BaseProvider):
         yield sse.emit_tool_delta(tc_index, args)
 
     def _process_tool_call(self, tc: dict, sse: SSEBuilder) -> Iterator[str]:
-        """Process a single tool call delta and yield SSE events."""
         tc_index = tc.get("index", 0)
         if tc_index < 0:
             tc_index = len(sse.blocks.tool_states)
@@ -172,9 +260,7 @@ class OpenAIChatTransport(BaseProvider):
             sse.blocks.register_tool_name(tc_index, incoming_name)
 
         state = sse.blocks.tool_states.get(tc_index)
-        resolved_id = (state.tool_id if state and state.tool_id else None) or tc.get(
-            "id"
-        )
+        resolved_id = (state.tool_id if state and state.tool_id else None) or tc.get("id")
         resolved_name = (state.name if state else "") or ""
 
         if not state or not state.started:
@@ -201,10 +287,12 @@ class OpenAIChatTransport(BaseProvider):
         yield from self._emit_tool_arg_delta(sse, tc_index, arguments)
 
     def _flush_task_arg_buffers(self, sse: SSEBuilder) -> Iterator[str]:
-        """Emit buffered Task args as a single JSON delta (best-effort)."""
         for tool_index, out in sse.blocks.flush_task_arg_buffers():
             yield sse.emit_tool_delta(tool_index, out)
 
+    # --------------------------------------------------------------------------
+    #  Main streaming entry point (never exposes network errors to user)
+    # --------------------------------------------------------------------------
     async def stream_response(
         self,
         request: Any,
@@ -213,7 +301,7 @@ class OpenAIChatTransport(BaseProvider):
         request_id: str | None = None,
         thinking_enabled: bool | None = None,
     ) -> AsyncIterator[str]:
-        """Stream response in Anthropic SSE format."""
+        """Stream response in Anthropic SSE format, retrying forever on failures."""
         with logger.contextualize(request_id=request_id):
             async for event in self._stream_response_impl(
                 request, input_tokens, request_id, thinking_enabled=thinking_enabled
@@ -228,7 +316,7 @@ class OpenAIChatTransport(BaseProvider):
         *,
         thinking_enabled: bool | None,
     ) -> AsyncIterator[str]:
-        """Shared streaming implementation."""
+        """Internal streaming that never exposes socket errors – retries forever."""
         tag = self._provider_name
         message_id = f"msg_{uuid.uuid4()}"
         sse = SSEBuilder(
@@ -257,9 +345,28 @@ class OpenAIChatTransport(BaseProvider):
         finish_reason = None
         usage_info = None
 
+        # Acquire rate limiter slot, then create stream (will retry forever internally)
         async with self._global_rate_limiter.concurrency_slot():
+            # _create_stream_with_retry loops forever; only non-retryable errors raise.
             try:
-                stream, body = await self._create_stream(body)
+                stream, _ = await self._create_stream_with_retry(body)
+            except Exception as e:
+                # Non-retryable error (e.g., 400, 401). Send generic error to user.
+                logger.error(f"[{tag}] Non-retryable error, sending fallback message: {e}")
+                for event in sse.ensure_text_block():
+                    yield event
+                yield sse.emit_text_delta(
+                    "I'm sorry, but your request cannot be processed due to an invalid configuration. "
+                    "Please contact support."
+                )
+                for event in sse.close_all_blocks():
+                    yield event
+                yield sse.message_delta("error", 0)
+                yield sse.message_stop()
+                return
+
+            # Process the stream, catching mid-stream interruptions gracefully
+            try:
                 async for chunk in stream:
                     if getattr(chunk, "usage", None):
                         usage_info = chunk.usage
@@ -276,22 +383,17 @@ class OpenAIChatTransport(BaseProvider):
                         finish_reason = choice.finish_reason
                         logger.debug("{} finish_reason: {}", tag, finish_reason)
 
-                    # Handle reasoning_content (OpenAI extended format)
                     reasoning = getattr(delta, "reasoning_content", None)
                     if thinking_enabled and reasoning:
                         for event in sse.ensure_thinking_block():
                             yield event
                         yield sse.emit_thinking_delta(reasoning)
 
-                    # Provider-specific extra reasoning (e.g. OpenRouter reasoning_details)
                     for event in self._handle_extra_reasoning(
-                        delta,
-                        sse,
-                        thinking_enabled=thinking_enabled,
+                        delta, sse, thinking_enabled=thinking_enabled
                     ):
                         yield event
 
-                    # Handle text content
                     if delta.content:
                         for part in think_parser.feed(delta.content):
                             if part.type == ContentType.THINKING:
@@ -301,22 +403,15 @@ class OpenAIChatTransport(BaseProvider):
                                     yield event
                                 yield sse.emit_thinking_delta(part.content)
                             else:
-                                filtered_text, detected_tools = heuristic_parser.feed(
-                                    part.content
-                                )
-
+                                filtered_text, detected_tools = heuristic_parser.feed(part.content)
                                 if filtered_text:
                                     for event in sse.ensure_text_block():
                                         yield event
                                     yield sse.emit_text_delta(filtered_text)
-
                                 for tool_use in detected_tools:
-                                    for event in _iter_heuristic_tool_use_sse(
-                                        sse, tool_use
-                                    ):
+                                    for event in _iter_heuristic_tool_use_sse(sse, tool_use):
                                         yield event
 
-                    # Handle native tool calls
                     if delta.tool_calls:
                         for event in sse.close_content_blocks():
                             yield event
@@ -332,47 +427,41 @@ class OpenAIChatTransport(BaseProvider):
                             for event in self._process_tool_call(tc_info, sse):
                                 yield event
 
-            except asyncio.CancelledError, GeneratorExit:
+            except (asyncio.CancelledError, GeneratorExit):
+                # Control flow: propagate
                 raise
             except Exception as e:
-                self._log_stream_transport_error(tag, req_tag, e)
-                mapped_e = map_error(e, rate_limiter=self._global_rate_limiter)
-                base_message = user_visible_message_for_mapped_provider_error(
-                    mapped_e,
-                    provider_name=tag,
-                    read_timeout_s=self._config.http_read_timeout,
-                )
-                error_message = append_request_id(base_message, request_id)
-                logger.info(
-                    "{}_STREAM: Emitting SSE error event for {}{}",
-                    tag,
-                    type(e).__name__,
-                    req_tag,
-                )
-                for event in sse.close_all_blocks():
-                    yield event
-                if sse.blocks.has_emitted_tool_block():
-                    # Avoid a second assistant text block after an emitted tool_use, which
-                    # breaks OpenAI history replay (issue #206) when Claude Code stores it.
-                    yield sse.emit_top_level_error(error_message)
+                error_lower = str(e).lower()
+                # Mid‑stream network interruption – finish gracefully with what we have
+                is_network_error = any(phrase in error_lower for phrase in [
+                    "incomplete chunked read",
+                    "peer closed connection",
+                    "remote disconnected",
+                    "socket connection",
+                    "empty",
+                    "malformed",
+                    "connection reset",
+                    "timeout",
+                ])
+                if is_network_error:
+                    logger.warning(f"[{tag}] ⚠ Stream interrupted mid‑flight, finishing early: {e}")
+                    if finish_reason is None:
+                        finish_reason = "error"
                 else:
-                    for event in sse.emit_error(error_message):
-                        yield event
-                yield sse.message_delta("end_turn", 1)
-                yield sse.message_stop()
-                return
+                    # Non‑network error – complete with error stop reason
+                    logger.error(f"[{tag}] Unexpected streaming error: {e}")
+                    if finish_reason is None:
+                        finish_reason = "error"
 
-        # Flush remaining content
+        # Flush remaining content from parsers
         remaining = think_parser.flush()
         if remaining:
             if remaining.type == ContentType.THINKING:
-                if not thinking_enabled:
-                    remaining = None
-                else:
+                if thinking_enabled:
                     for event in sse.ensure_thinking_block():
                         yield event
                     yield sse.emit_thinking_delta(remaining.content)
-            if remaining and remaining.type == ContentType.TEXT:
+            elif remaining.type == ContentType.TEXT:
                 for event in sse.ensure_text_block():
                     yield event
                 yield sse.emit_text_delta(remaining.content)
@@ -381,6 +470,7 @@ class OpenAIChatTransport(BaseProvider):
             for event in _iter_heuristic_tool_use_sse(sse, tool_use):
                 yield event
 
+        # Ensure at least one content block
         has_started_tool = any(s.started for s in sse.blocks.tool_states.values())
         has_content_blocks = (
             sse.blocks.text_index != -1
@@ -391,14 +481,7 @@ class OpenAIChatTransport(BaseProvider):
             for event in sse.ensure_text_block():
                 yield event
             yield sse.emit_text_delta(" ")
-        elif (
-            not has_started_tool
-            and not sse.accumulated_text.strip()
-            and sse.accumulated_reasoning.strip()
-        ):
-            # Some OpenAI-compatible models (e.g. NIM reasoning templates) stream only
-            # ``reasoning_content`` with no ``content``; emit a minimal text block so
-            # clients and smoke ``text_content()`` see a completed assistant message.
+        elif not has_started_tool and not sse.accumulated_text.strip() and sse.accumulated_reasoning.strip():
             for event in sse.ensure_text_block():
                 yield event
             yield sse.emit_text_delta(" ")
@@ -409,15 +492,12 @@ class OpenAIChatTransport(BaseProvider):
         for event in sse.close_all_blocks():
             yield event
 
-        completion = (
-            getattr(usage_info, "completion_tokens", None)
-            if usage_info is not None
-            else None
-        )
-        if isinstance(completion, int):
-            output_tokens = completion
+        # Token accounting
+        if usage_info and hasattr(usage_info, "completion_tokens"):
+            output_tokens = usage_info.completion_tokens
         else:
             output_tokens = sse.estimate_output_tokens()
+
         if usage_info and hasattr(usage_info, "prompt_tokens"):
             provider_input = usage_info.prompt_tokens
             if isinstance(provider_input, int):
@@ -427,5 +507,6 @@ class OpenAIChatTransport(BaseProvider):
                     provider_input,
                     provider_input - input_tokens,
                 )
+
         yield sse.message_delta(map_stop_reason(finish_reason), output_tokens)
         yield sse.message_stop()
