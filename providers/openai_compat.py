@@ -78,6 +78,10 @@ class OpenAIChatTransport(BaseProvider):
             rate_window=config.rate_window,
             max_concurrency=config.max_concurrency,
         )
+        # --- Nouveaux paramètres pour le réessai périodique ---
+        self._retry_delay = getattr(config, 'retry_delay', 15)   # secondes entre les tentatives
+        self._max_retries = getattr(config, 'max_retries', None)  # None = infini
+        # ----------------------------------------------------
         http_client = None
         if config.proxy:
             http_client = httpx.AsyncClient(
@@ -137,24 +141,52 @@ class OpenAIChatTransport(BaseProvider):
         """Return provider-specific per-tool argument aliases for this request."""
         return {}
 
-    async def _create_stream(self, body: dict) -> tuple[Any, dict]:
-        """Create a streaming chat completion, optionally retrying once."""
-        try:
-            create_body = self._prepare_create_body(body)
-            stream = await self._global_rate_limiter.execute_with_retry(
-                self._client.chat.completions.create, **create_body, stream=True
-            )
-            return stream, body
-        except Exception as error:
-            retry_body = self._get_retry_request_body(error, body)
-            if retry_body is None:
-                raise
+    # ------------------------------------------------------------
+    # Nouvelle méthode : boucle de réessai périodique
+    # ------------------------------------------------------------
+    async def _call_with_retry_loop(self, initial_body: dict) -> tuple[Any, dict]:
+        """
+        Appelle l'API avec réessai périodique (toutes les self._retry_delay secondes)
+        jusqu'à succès ou dépassement de self._max_retries.
+        Retourne (stream, body_used_for_success).
+        """
+        attempt = 0
+        current_body = initial_body
+        last_exception = None
 
-            create_retry_body = self._prepare_create_body(retry_body)
-            stream = await self._global_rate_limiter.execute_with_retry(
-                self._client.chat.completions.create, **create_retry_body, stream=True
-            )
-            return stream, retry_body
+        while True:
+            attempt += 1
+            if self._max_retries is not None and attempt > self._max_retries:
+                logger.error(
+                    f"{self._provider_name}: max retries ({self._max_retries}) exceeded, "
+                    f"last error: {last_exception}"
+                )
+                raise last_exception
+
+            try:
+                # Utiliser le rate limiter existant (qui gère déjà des retries immédiats)
+                create_body = self._prepare_create_body(current_body)
+                stream = await self._global_rate_limiter.execute_with_retry(
+                    self._client.chat.completions.create, **create_body, stream=True
+                )
+                # Succès
+                return stream, current_body
+            except Exception as e:
+                last_exception = e
+                logger.warning(
+                    f"{self._provider_name}: request failed (attempt {attempt}): {e}. "
+                    f"Retrying in {self._retry_delay}s..."
+                )
+                # Possibilité de modifier le body pour la prochaine tentative
+                new_body = self._get_retry_request_body(e, current_body)
+                if new_body is not None:
+                    current_body = new_body
+                await asyncio.sleep(self._retry_delay)
+
+    async def _create_stream(self, body: dict) -> tuple[Any, dict]:
+        """Crée un stream avec réessai périodique (au lieu d'une seule tentative)."""
+        return await self._call_with_retry_loop(body)
+    # ------------------------------------------------------------
 
     def _restore_aliased_tool_arguments(
         self, argument_json: str, aliases: dict[str, str]
@@ -377,6 +409,7 @@ class OpenAIChatTransport(BaseProvider):
 
         async with self._global_rate_limiter.concurrency_slot():
             try:
+                # Utilisation de la nouvelle méthode de réessai périodique
                 stream, body = await self._create_stream(body)
                 tool_argument_aliases = self._tool_argument_aliases(body)
                 async for chunk in stream:
