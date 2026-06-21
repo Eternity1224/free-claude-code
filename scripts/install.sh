@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO_GIT_URL="git+https://github.com/Alishahryar1/free-claude-code.git"
+REPO_GIT_URL="git+https://github.com/Eternity1224/free-claude-code.git"
 PYTHON_VERSION="3.14.0"
 UV_INSTALL_URL="https://astral.sh/uv/install.sh"
 
