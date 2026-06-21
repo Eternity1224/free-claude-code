@@ -64,7 +64,7 @@ Windows PowerShell:
 irm "https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.ps1?raw=1" | iex
 ```
 
-Review the installers at [scripts/install.sh](https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.sh) and [scripts/install.ps1](https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.ps1).
+Review the installers at [scripts/install.sh](https://github.com/Eternity1224/free-claude-code/blob/main/scripts/install.sh) and [scripts/install.ps1](https://github.com/Eternity1224/free-claude-code/blob/main/scripts/install.ps1).
 
 ### 2. Start The Proxy
 
